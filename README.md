@@ -2788,6 +2788,25 @@ Read as: "api issues block auth issues through 3 dependency relationships." Rows
 
 `bv` can generate **self-contained static websites** for sharing project status with stakeholders who don't have terminal access.
 
+### Dependency columns
+
+The graph opens with the **Dependencies** layout. Tasks with no unresolved blockers appear on the left.
+Each later column contains the next dependency level. A task appears after all its blockers, and each task appears once.
+Arrows point from blockers to dependent tasks. Related links do not affect the order.
+
+The **Hide closed beads** checkbox starts checked. Clear it to include completed tasks.
+Each change rebuilds the columns. Search filters retain dependency levels, so a hidden blocker cannot make a task appear ready.
+The viewer reports dependency cycles and keeps the previous layout when it cannot assign levels.
+
+Build the viewer and run the dependency checks with these commands:
+
+```bash
+go build -o bin/bv ./cmd/bv
+node pkg/export/viewer_assets/graph.test.js
+```
+
+Use the resulting binary for exports to include this layout.
+
 ### Interactive Wizard
 
 ```bash

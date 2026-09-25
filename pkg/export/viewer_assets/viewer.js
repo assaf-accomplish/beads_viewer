@@ -3077,10 +3077,7 @@ function beadsApp() {
      */
     graphZoomToFit() {
       if (!this.forceGraphModule || !this.forceGraphReady) return;
-      const graph = this.forceGraphModule.getGraph?.();
-      if (graph && typeof graph.zoomToFit === "function") {
-        graph.zoomToFit(400, 50);
-      }
+      this.forceGraphModule.zoomToFit();
     },
 
     /**

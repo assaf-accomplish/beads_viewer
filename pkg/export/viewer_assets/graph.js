@@ -100,6 +100,13 @@ const LABEL_COLORS = [
  * Each preset configures force simulation parameters optimized for specific use cases.
  */
 const LAYOUT_PRESETS = {
+  dependencies: {
+    name: "Dependencies",
+    description: "Blockers on the left, dependent tasks on the right",
+    icon: "🌳",
+    config: { warmupTicks: 0, cooldownTicks: 0 },
+    viewMode: VIEW_MODES.FORCE,
+  },
   // Default force-directed layout - balanced readability
   force: {
     name: "Force-Directed",
@@ -237,7 +244,7 @@ class GraphStore {
 
     // UI State
     this.viewMode = VIEW_MODES.FORCE;
-    this.currentPreset = "force"; // Layout preset (bv-97)
+    this.currentPreset = "dependencies";
     this.selectedNode = null;
     this.hoveredNode = null;
     this.highlightedNodes = new Set();
@@ -256,7 +263,7 @@ class GraphStore {
       priority: null,
       labels: [],
       search: "",
-      showClosed: true, // Default to showing all issues in static export
+      showClosed: false,
     };
 
     // Config
@@ -649,6 +656,67 @@ function isResolvedIssue(issue) {
   return issue.status === "closed" || issue.status === "tombstone";
 }
 
+// Rank the full scope before search filters, so hidden blockers still impose order.
+export function computeDependencyRanks(issues, dependencies) {
+  const ranks = new Map(issues.map((issue) => [issue.id, 0]));
+  const remaining = new Map(issues.map((issue) => [issue.id, 0]));
+  const dependents = new Map(issues.map((issue) => [issue.id, new Set()]));
+  for (const dep of dependencies) {
+    if (!isBlockingDependency(dep) || !ranks.has(dep.issue_id)) continue;
+    if (!ranks.has(dep.depends_on_id)) {
+      // An unavailable blocker must not make this task look ready.
+      ranks.set(dep.issue_id, Math.max(1, ranks.get(dep.issue_id)));
+      continue;
+    }
+    const children = dependents.get(dep.depends_on_id);
+    if (children.has(dep.issue_id)) continue;
+    children.add(dep.issue_id);
+    remaining.set(dep.issue_id, remaining.get(dep.issue_id) + 1);
+  }
+  const queue = issues.filter((issue) => remaining.get(issue.id) === 0).map((issue) => issue.id);
+  for (let i = 0; i < queue.length; i++) {
+    const id = queue[i];
+    for (const child of dependents.get(id)) {
+      ranks.set(child, Math.max(ranks.get(child), ranks.get(id) + 1));
+      remaining.set(child, remaining.get(child) - 1);
+      if (remaining.get(child) === 0) queue.push(child);
+    }
+  }
+  if (queue.length !== issues.length) {
+    throw new Error("Dependency columns need an acyclic graph. Remove dependency cycles, then try again.");
+  }
+  return ranks;
+}
+
+function positionDependencyColumns(nodes, dependencies, ranks) {
+  const columns = new Map();
+  const parents = new Map(nodes.map((node) => [node.id, []]));
+  for (const dep of dependencies) {
+    if (isBlockingDependency(dep) && parents.has(dep.issue_id)) {
+      parents.get(dep.issue_id).push(dep.depends_on_id);
+    }
+  }
+  for (const node of nodes) {
+    node.dependencyRank = ranks.get(node.id);
+    if (!columns.has(node.dependencyRank)) columns.set(node.dependencyRank, []);
+    columns.get(node.dependencyRank).push(node);
+  }
+  const positions = new Map();
+  const center = Math.max(0, ...columns.keys()) * 110;
+  for (const [rank, column] of [...columns].sort(([a], [b]) => a - b)) {
+    const parentY = (node) => {
+      const ys = parents.get(node.id).filter((id) => positions.has(id)).map((id) => positions.get(id));
+      return ys.length ? ys.reduce((sum, y) => sum + y, 0) / ys.length : 0;
+    };
+    column.sort((a, b) => parentY(a) - parentY(b) || a.id.localeCompare(b.id));
+    column.forEach((node, row) => {
+      node.x = node.fx = rank * 220 - center;
+      node.y = node.fy = (row - (column.length - 1) / 2) * 80;
+      positions.set(node.id, node.y);
+    });
+  }
+}
+
 function buildWasmGraph() {
   if (!store.wasmReady) return;
 
@@ -798,7 +866,8 @@ export async function initGraph(containerId, options = {}) {
     // Link rendering
     .linkCanvasObject(drawLink)
     .linkCanvasObjectMode(() => "replace")
-    .linkDirectionalParticles((node) => (store.config.enableParticles ? 2 : 0))
+    // Dependency columns draw particles in drawLink to reverse the stored edge direction.
+    .linkDirectionalParticles(() => store.currentPreset !== "dependencies" && store.config.enableParticles ? 2 : 0)
     .linkDirectionalParticleSpeed(store.config.particleSpeed)
     .linkDirectionalParticleColor(() => THEME.accent.cyan)
 
@@ -1060,7 +1129,16 @@ export function loadData(issues, dependencies, layout = null) {
   buildLabelColorMap();
 
   // Prepare graph data with optional pre-computed positions
-  const graphData = prepareGraphData(layout);
+  let graphData;
+  let presetFallback = false;
+  try {
+    graphData = prepareGraphData(layout);
+  } catch (error) {
+    store.currentPreset = "force";
+    presetFallback = true;
+    showToast(error.message, "warning");
+    graphData = prepareGraphData(layout);
+  }
 
   // Update graph
   // Valid starting coordinates make synchronous warmup redundant. Paint the
@@ -1068,11 +1146,16 @@ export function loadData(issues, dependencies, layout = null) {
   store.graph.warmupTicks(layout ? 0 : store.config.warmupTicks);
   store.graph.graphData(graphData);
 
+  // Apply fixed columns after loading, while preserving seeded force layouts.
+  if (store.currentPreset === "dependencies" || presetFallback) applyPreset(store.currentPreset);
+
   // Compute max metric values for heatmap normalization (after graph data is set)
   computeMaxMetrics();
 
-  // Fit immediately if pre-computed, otherwise wait for simulation
-  if (layout?.positions) {
+  // Dependency columns already fit in applyPreset and do not need simulation.
+  if (store.currentPreset === "dependencies") {
+    dispatchEvent("simulationProgress", { alpha: 0, progress: 100, done: true });
+  } else if (layout?.positions) {
     store.graph.zoomToFit(200, 50);
   } else {
     const graph = store.graph;
@@ -1095,9 +1178,18 @@ export function loadData(issues, dependencies, layout = null) {
 
 function prepareGraphData(layout = null) {
   const { issues, dependencies, filters, metrics } = store;
+  const blockingDependencies = dependencies.filter(isBlockingDependency);
+  const connectedIds = new Set(blockingDependencies.flatMap((dep) => [dep.issue_id, dep.depends_on_id]));
+  const scope = issues.filter((issue) => filters.showClosed || !isResolvedIssue(issue));
+  const resolvedIDs = new Set(issues.filter(isResolvedIssue).map((issue) => issue.id));
+  const activeDependencies = dependencies.filter((dep) => filters.showClosed || !resolvedIDs.has(dep.depends_on_id));
+  const ranks = store.currentPreset === "dependencies" ? computeDependencyRanks(scope, activeDependencies) : null;
 
   // Filter nodes
   let nodes = issues.filter((issue) => {
+    // Context links do not connect beads in the dependency graph.
+    if (!connectedIds.has(issue.id)) return false;
+
     // Status filter
     if (filters.status && issue.status !== filters.status) return false;
     if (!filters.showClosed && isResolvedIssue(issue)) return false;
@@ -1125,8 +1217,7 @@ function prepareGraphData(layout = null) {
   const nodeIds = new Set(nodes.map((n) => n.id));
 
   // Filter links
-  const links = dependencies
-    .filter(isBlockingDependency)
+  const links = blockingDependencies
     .filter((d) => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
     .map((d) => ({
       source: d.issue_id,
@@ -1187,6 +1278,7 @@ function prepareGraphData(layout = null) {
     });
   }
 
+  if (ranks) positionDependencyColumns(nodes, activeDependencies, ranks);
   return { nodes, links };
 }
 
@@ -1364,11 +1456,12 @@ function drawNode(node, ctx, globalScale) {
   }
 
   // Label (when zoomed in)
-  if (store.config.showLabels && globalScale > store.config.labelZoomThreshold) {
+  const ordered = store.currentPreset === "dependencies";
+  if (store.config.showLabels && (ordered || globalScale > store.config.labelZoomThreshold)) {
     // Font should be ~10px on SCREEN regardless of zoom
     // worldFontSize * globalScale ≈ 10-12px
     // Clamp world coords: min 3px (readable at high zoom), max 8px (not huge when zoomed out)
-    const fontSize = Math.min(8, Math.max(3, 10 / globalScale));
+    const fontSize = ordered ? 10 / globalScale : Math.min(8, Math.max(3, 10 / globalScale));
     ctx.font = `500 ${fontSize}px 'Inter', 'JetBrains Mono', sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
@@ -1378,7 +1471,9 @@ function drawNode(node, ctx, globalScale) {
 
     // Show title when zoomed in enough for it to be readable
     let label = node.id;
-    if (globalScale > 1.5) {
+    if (ordered && globalScale <= 1) {
+      label = truncate(node.id, Math.max(6, Math.floor(200 * globalScale / 6)));
+    } else if (globalScale > 1.5) {
       label = truncate(node.title || node.id, 30);
     } else if (globalScale > 1.0) {
       label = truncate(node.title || node.id, 20);
@@ -1571,8 +1666,10 @@ function getLinkWidth(link, globalScale) {
 }
 
 function drawLink(link, ctx, globalScale) {
-  const start = link.source;
-  const end = link.target;
+  // Stored edges point to prerequisites. This view shows the work flow instead.
+  const ordered = store.currentPreset === "dependencies";
+  const start = ordered ? link.target : link.source;
+  const end = ordered ? link.source : link.target;
 
   // Check for undefined coordinates (not falsy - 0 is valid)
   if (start.x === undefined || end.x === undefined) return;
@@ -1590,7 +1687,7 @@ function drawLink(link, ctx, globalScale) {
   const dx = end.x - start.x;
   const dy = end.y - start.y;
   const dist = Math.sqrt(dx * dx + dy * dy);
-  const curvature = 0.2;
+  const curvature = ordered ? 0 : 0.2;
   const cx = (start.x + end.x) / 2 + dy * curvature;
   const cy = (start.y + end.y) / 2 - dx * curvature;
 
@@ -1598,6 +1695,19 @@ function drawLink(link, ctx, globalScale) {
   ctx.moveTo(start.x, start.y);
   ctx.quadraticCurveTo(cx, cy, end.x, end.y);
   ctx.stroke();
+
+  if (ordered && store.config.enableParticles) {
+    const progress = performance.now() * store.config.particleSpeed * 0.06;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = THEME.accent.cyan;
+    for (const offset of [0, 0.5]) {
+      const t = (progress + offset) % 1;
+      ctx.beginPath();
+      ctx.arc(start.x + dx * t, start.y + dy * t, 2 / Math.sqrt(globalScale), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = opacity;
+  }
 
   // Arrowhead
   const endSize = getNodeSize(end);
@@ -2509,9 +2619,19 @@ function formatCyclePath(cycle) {
 // ============================================================================
 
 export function setFilter(key, value) {
+  const previous = store.filters[key];
   store.filters[key] = value;
-  const graphData = prepareGraphData();
+  let graphData;
+  try {
+    graphData = prepareGraphData();
+  } catch (error) {
+    store.filters[key] = previous;
+    showToast(error.message, "warning");
+    dispatchEvent("filterChange", { filters: { ...store.filters } });
+    return;
+  }
   store.graph.graphData(graphData);
+  if (store.currentPreset === "dependencies") store.graph.zoomToFit(400, 80);
   dispatchEvent("filterChange", { filters: { ...store.filters } });
 }
 
@@ -2521,7 +2641,7 @@ export function clearFilters() {
     priority: null,
     labels: [],
     search: "",
-    showClosed: true, // Reset to showing all issues
+    showClosed: store.filters.showClosed,
   };
   const graphData = prepareGraphData();
   store.graph.graphData(graphData);
@@ -2547,7 +2667,7 @@ export function focusNode(nodeId, zoom = 2) {
 }
 
 export function zoomToFit(padding = 50) {
-  store.graph.zoomToFit(400, padding);
+  store.graph.zoomToFit(400, store.currentPreset === "dependencies" ? Math.max(80, padding) : padding);
 }
 
 export function resetView() {
@@ -2558,6 +2678,13 @@ export function resetView() {
 }
 
 export function setViewMode(mode) {
+  if (store.currentPreset === "dependencies") {
+    store.currentPreset = "force";
+    for (const node of store.graph.graphData().nodes) node.fx = node.fy = null;
+    store.graph.enableNodeDrag(true).autoPauseRedraw(true).warmupTicks(100).cooldownTicks(300)
+      .linkDirectionalParticles(() => store.config.enableParticles ? 2 : 0);
+    dispatchEvent("presetApplied", { preset: "force", config: LAYOUT_PRESETS.force });
+  }
   store.viewMode = mode;
 
   // Deactivate galaxy mode if switching away from it
@@ -2706,7 +2833,7 @@ function applyLabelGalaxyLayout() {
 /**
  * Apply a layout preset by name.
  * Presets configure force simulation parameters and optionally set view mode.
- * @param {string} presetName - One of: 'force', 'compact', 'spread', 'orthogonal', 'radial', 'cluster'
+ * @param {string} presetName - A key from LAYOUT_PRESETS.
  * @returns {boolean} True if preset was applied successfully
  */
 function applyPreset(presetName) {
@@ -2719,6 +2846,32 @@ function applyPreset(presetName) {
   }
 
   console.log(`[Graph] Applying preset: ${preset.name} (${presetName})`);
+
+  const previousPreset = store.currentPreset;
+  if (presetName === "dependencies") {
+    store.currentPreset = presetName;
+    let graphData;
+    try {
+      graphData = prepareGraphData();
+    } catch (error) {
+      store.currentPreset = previousPreset;
+      showToast(error.message, "warning");
+      return false;
+    }
+    if (labelClusterState.active) deactivateLabelGalaxy();
+    store.graph.warmupTicks(0).cooldownTicks(0).enableNodeDrag(false)
+      .autoPauseRedraw(!store.config.enableParticles).linkDirectionalParticles(0).graphData(graphData);
+    store.graph.zoomToFit(400, 80);
+    dispatchEvent("presetApplied", { preset: presetName, config: preset });
+    return true;
+  }
+
+  // Release fixed columns when switching back to a force layout.
+  for (const node of store.graph.graphData().nodes) {
+    node.fx = node.fy = null;
+  }
+  store.graph.enableNodeDrag(true).autoPauseRedraw(true).d3Force("radial", null)
+    .linkDirectionalParticles(() => store.config.enableParticles ? 2 : 0);
 
   // Update store config with preset values
   Object.assign(store.config, preset.config);

@@ -2811,7 +2811,9 @@
 
     <!-- Full-frame Graph View (outside main for full viewport) -->
     <div x-show="view === 'graph'"
-         x-data="{ currentPreset: 'force', showControls: true }"
+         x-data="{ currentPreset: 'dependencies', showControls: false, hideClosed: true }"
+         x-init="document.addEventListener('bv-graph:presetApplied', e => currentPreset = e.detail.preset);
+                 document.addEventListener('bv-graph:filterChange', e => hideClosed = !e.detail.filters.showClosed)"
          class="fixed inset-0 z-40 bg-gray-50 dark:bg-gray-900"
          style="top: 64px;">
 
@@ -3029,7 +3031,18 @@
       </div>
 
       <!-- Floating Control Panel -->
-      <div class="absolute top-4 left-4 right-4 flex items-start justify-between pointer-events-none">
+      <div x-show="!showControls" class="absolute top-4 left-4 right-4 flex items-center justify-between pointer-events-none">
+        <button @click="view = 'dashboard'" class="pointer-events-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-xs">Back</button>
+        <div class="pointer-events-auto flex items-center gap-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2 text-xs">
+          <label class="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" x-model="hideClosed" :disabled="!forceGraphReady"
+                   @change="forceGraphModule && forceGraphModule.setFilter('showClosed', !hideClosed)">
+            Hide closed beads
+          </label>
+          <button @click="showControls = true" :aria-expanded="showControls">Layouts</button>
+        </div>
+      </div>
+      <div x-show="showControls" class="absolute top-4 left-4 right-4 flex items-start justify-between pointer-events-none">
         <!-- Left controls -->
         <div class="pointer-events-auto flex flex-col gap-2 md:gap-3">
           <!-- Back button - larger touch target on mobile -->
@@ -3044,7 +3057,7 @@
 
           <!-- Stats overlay - more compact on mobile -->
           <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
-            <div class="text-[10px] md:text-xs text-gray-500 dark:text-gray-400 mb-1">Showing</div>
+            <div class="text-[10px] md:text-xs text-gray-500 dark:text-gray-400 mb-1">Project totals</div>
             <div class="flex items-center gap-2 md:gap-4">
               <div class="flex items-center gap-1">
                 <div class="w-2 h-2 rounded-full bg-green-500"></div>
@@ -3062,6 +3075,23 @@
         <div class="pointer-events-auto">
           <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2">
             <div class="text-xs text-gray-500 dark:text-gray-400 mb-2 px-1">Layout</div>
+            <button @click="showControls = false" class="w-full text-xs mb-2 px-1 text-right">Hide controls</button>
+            <button @click="applyGraphPreset('dependencies')"
+                    :aria-pressed="currentPreset === 'dependencies'"
+                    :class="currentPreset === 'dependencies' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
+                    class="w-full px-2 py-1.5 mb-2 text-xs rounded-md flex items-center gap-1"
+                    title="Place blockers on the left and dependent tasks on the right">
+              <span aria-hidden="true">🌳</span> Dependencies
+            </button>
+            <label class="flex items-center gap-2 px-1 mb-2 text-xs cursor-pointer">
+              <input type="checkbox" x-model="hideClosed"
+                     @change="forceGraphModule && forceGraphModule.setFilter('showClosed', !hideClosed)"
+                     :disabled="!forceGraphReady">
+              Hide closed beads
+            </label>
+            <p x-show="currentPreset === 'dependencies'" class="text-xs text-gray-500 dark:text-gray-400 mb-2 px-1">
+              Blockers on the left. Goals on the right.
+            </p>
             <div class="grid grid-cols-3 gap-1">
               <button @click="applyGraphPreset('force'); currentPreset = 'force'"
                       :class="currentPreset === 'force' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
@@ -3128,7 +3158,7 @@
       <div class="absolute bottom-4 left-4 pointer-events-auto transition-opacity duration-200"
            :class="graphDetailNode ? 'hidden md:block' : ''">
         <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
-          <div class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2" x-text="graphHeatmapActive ? 'Heatmap: ' + {pagerank:'PageRank',betweenness:'Betweenness',critical:'Critical Path',indegree:'In-Degree'}[graphSizeMetric] : 'Legend'"></div>
+          <div x-show="showControls" class="text-xs text-gray-500 dark:text-gray-400 mb-1.5 md:mb-2" x-text="graphHeatmapActive ? 'Heatmap: ' + {pagerank:'PageRank',betweenness:'Betweenness',critical:'Critical Path',indegree:'In-Degree'}[graphSizeMetric] : 'Legend'"></div>
           <!-- Status color legend (default) -->
           <div x-show="!graphHeatmapActive" class="flex flex-wrap gap-x-3 md:gap-x-4 gap-y-1 text-[10px] md:text-xs">
             <div class="flex items-center gap-1"><div class="w-2.5 h-2.5 md:w-3 md:h-3 rounded-full bg-green-500"></div> Open</div>
@@ -3145,7 +3175,7 @@
             </div>
           </div>
           <!-- Keyboard hints only on desktop -->
-          <div class="hidden md:block mt-2 pt-2 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400 space-y-1">
+          <div x-show="showControls" class="hidden md:block mt-2 pt-2 border-t border-gray-200 dark:border-gray-700 text-xs text-gray-500 dark:text-gray-400 space-y-1">
             <div>Click nodes for details • Drag to pan • Scroll to zoom</div>
             <div class="flex flex-wrap gap-x-3 gap-y-0.5">
               <span><kbd class="px-1 py-0.5 bg-gray-200 dark:bg-gray-600 rounded text-[10px]">←→</kbd> Priority nav</span>
